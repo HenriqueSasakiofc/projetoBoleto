@@ -1,41 +1,109 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Depends, BackgroundTasks, HTTPException
+from sqlalchemy.orm import Session
 
-# Aqui criamos o "aplicativo" da API.
-# O Uvicorn procura exatamente essa variável quando você roda: app.main:app
-app = FastAPI(title="Projeto Boleto")
+from .db import Base, engine, SessionLocal
+from . import models, schemas
+from .services.provider import MockBoletoProvider
+from .services.notifier import EmailNotifier
 
-# Isso é uma "rota" (endpoint) HTTP.
-# Quando alguém acessar /health, essa função responde.
+# cria tabelas no SQLite se ainda não existirem
+Base.metadata.create_all(bind=engine)
+
+app = FastAPI(title="Projeto Boleto MVP")
+
+def get_db():
+    # abre sessão do banco por request
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+provider = MockBoletoProvider()
+notifier = EmailNotifier()
+
 @app.get("/health")
 def health():
-    # Isso é o JSON que a API devolve
     return {"ok": True}
 
-from fastapi import FastAPI
-from pydantic import BaseModel, EmailStr
-from datetime import date
+@app.post("/cobrancas", response_model=schemas.CobrancaOut)
+def criar_cobranca(payload: schemas.CobrancaCreate, background: BackgroundTasks, db: Session = Depends(get_db)):
+    # 1) cria a cobrança no banco
+    cobranca = models.Cobranca(
+        remetente_nome=payload.remetente_nome,
+        remetente_email=str(payload.remetente_email),
+        sacado_nome=payload.sacado_nome,
+        sacado_email=str(payload.sacado_email),
+        valor=payload.valor,
+        vencimento=payload.vencimento,
+        status="CRIADA",
+    )
+    db.add(cobranca)
+    db.commit()
+    db.refresh(cobranca)  # agora cobranca.id existe
 
-app = FastAPI(title="Projeto Boleto")
+    # 2) gera boleto (mock)
+    boleto_data = provider.gerar_boleto(
+        valor=cobranca.valor,
+        vencimento=cobranca.vencimento,
+        sacado_nome=cobranca.sacado_nome
+    )
 
-@app.get("/health")
-def health():
-    return {"ok": True}
+    # 3) salva boleto e atualiza status da cobrança
+    cobranca.provider_charge_id = boleto_data["provider_charge_id"]
+    cobranca.status = "BOLETO_GERADO"
 
-# 1) Este bloco define o "formato" do JSON que a API aceita no POST /cobrancas
-class CobrancaCreate(BaseModel):
-    remetente_nome: str
-    remetente_email: EmailStr
-    sacado_nome: str
-    sacado_email: EmailStr
-    valor: float
-    vencimento: date
+    boleto = models.Boleto(
+        cobranca_id=cobranca.id,
+        linha_digitavel=boleto_data["linha_digitavel"],
+        pdf_url=boleto_data["pdf_url"],
+        status="GERADO"
+    )
+    db.add(boleto)
 
-# 2) Esta rota recebe o JSON, valida automaticamente e devolve um retorno
-@app.post("/cobrancas")
-def criar_cobranca(payload: CobrancaCreate):
-    # Aqui, "payload" já vem validado (email válido, data no formato certo, etc.)
+    # 4) registra uma notificação pendente
+    notif = models.Notificacao(
+        cobranca_id=cobranca.id,
+        tipo="EMAIL",
+        para=cobranca.remetente_email,
+        status="PENDENTE",
+        tentativas=0,
+    )
+    db.add(notif)
+
+    db.commit()
+
+    # 5) envia notificação em background (não trava a API)
+    background.add_task(
+        notifier.enviar_email_boleto_gerado,
+        cobranca.remetente_email,
+        cobranca.id,
+        boleto.pdf_url,
+        boleto.linha_digitavel
+    )
+
     return {
-        "status": "CRIADA",
-        "recebido": payload.model_dump()
+        "id": cobranca.id,
+        "status": cobranca.status,
+        "boleto": {
+            "linha_digitavel": boleto.linha_digitavel,
+            "pdf_url": boleto.pdf_url
+        }
     }
 
+@app.get("/cobrancas/{cobranca_id}", response_model=schemas.CobrancaOut)
+def buscar_cobranca(cobranca_id: int, db: Session = Depends(get_db)):
+    cobranca = db.query(models.Cobranca).filter(models.Cobranca.id == cobranca_id).first()
+    if not cobranca:
+        raise HTTPException(status_code=404, detail="Cobrança não encontrada")
+
+    boleto = db.query(models.Boleto).filter(models.Boleto.cobranca_id == cobranca.id).first()
+
+    return {
+        "id": cobranca.id,
+        "status": cobranca.status,
+        "boleto": None if not boleto else {
+            "linha_digitavel": boleto.linha_digitavel,
+            "pdf_url": boleto.pdf_url
+        }
+    }
