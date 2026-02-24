@@ -1,20 +1,19 @@
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel
 from datetime import date
 from typing import Optional
 
-class CobrancaCreate(BaseModel):
-    remetente_nome: str
-    remetente_email: EmailStr
-    sacado_nome: str
-    sacado_email: EmailStr
-    valor: float
-    vencimento: date
+class ImportResult(BaseModel):
+    clientes_importados: int
+    cobrancas_importadas: int
+    cobrancas_sem_email: int
 
-class BoletoOut(BaseModel):
-    linha_digitavel: str
-    pdf_url: str
+class RunResult(BaseModel):
+    enviados: int
+    pulados: int
+    sem_email: int
+    erros: int
 
-class CobrancaOut(BaseModel):
-    id: int
-    status: str
-    boleto: Optional[BoletoOut] = None
+class MarcarPagoIn(BaseModel):
+    nosso_numero: Optional[str] = None
+    documento: Optional[str] = None
+    pago_em: Optional[date] = None

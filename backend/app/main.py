@@ -1,109 +1,167 @@
-from fastapi import FastAPI, Depends, BackgroundTasks, HTTPException
+from fastapi import FastAPI, Depends, UploadFile, File, HTTPException
 from sqlalchemy.orm import Session
+from datetime import date
 
 from .db import Base, engine, SessionLocal
 from . import models, schemas
-from .services.provider import MockBoletoProvider
-from .services.notifier import EmailNotifier
+from .services.importer import import_from_excels
+from .services.notifier import DevMailer, build_charge_email, build_paid_email
 
-# cria tabelas no SQLite se ainda não existirem
+from .services.rules import should_send_today
+
+@app.get("/simular-cobranca")
+def simular_cobranca(db: Session = Depends(get_db)):
+    hoje = date.today()
+    cobrancas = db.query(models.Cobranca).filter(models.Cobranca.status == "ABERTO").all()
+
+    vai_cobrar = []
+    nao_vai = []
+
+    for c in cobrancas:
+        if not c.email_cobranca:
+            nao_vai.append({"id": c.id, "motivo": "SEM_EMAIL"})
+            continue
+
+        if should_send_today(hoje, c.vencimento, c.ultimo_envio_em):
+            vai_cobrar.append({"id": c.id, "cliente": c.cliente_nome, "vencimento": str(c.vencimento)})
+        else:
+            nao_vai.append({"id": c.id, "motivo": "REGRA_NAO_PERMITE", "vencimento": str(c.vencimento)})
+
+    return {"hoje": str(hoje), "vai_cobrar": vai_cobrar, "nao_vai": nao_vai}
+
+
 Base.metadata.create_all(bind=engine)
 
-app = FastAPI(title="Projeto Boleto MVP")
+app = FastAPI(title="Cobrador MVP")
 
 def get_db():
-    # abre sessão do banco por request
     db = SessionLocal()
     try:
         yield db
     finally:
         db.close()
 
-provider = MockBoletoProvider()
-notifier = EmailNotifier()
+mailer = DevMailer()
 
 @app.get("/health")
 def health():
     return {"ok": True}
 
-@app.post("/cobrancas", response_model=schemas.CobrancaOut)
-def criar_cobranca(payload: schemas.CobrancaCreate, background: BackgroundTasks, db: Session = Depends(get_db)):
-    # 1) cria a cobrança no banco
-    cobranca = models.Cobranca(
-        remetente_nome=payload.remetente_nome,
-        remetente_email=str(payload.remetente_email),
-        sacado_nome=payload.sacado_nome,
-        sacado_email=str(payload.sacado_email),
-        valor=payload.valor,
-        vencimento=payload.vencimento,
-        status="CRIADA",
-    )
-    db.add(cobranca)
+@app.post("/importar", response_model=schemas.ImportResult)
+async def importar(
+    contas: UploadFile = File(...),
+    clientes: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
+    contas_bytes = await contas.read()
+    clientes_bytes = await clientes.read()
+
+    c1, c2, sem_email = import_from_excels(db, contas_bytes, clientes_bytes)
+    return {"clientes_importados": c1, "cobrancas_importadas": c2, "cobrancas_sem_email": sem_email}
+
+@app.post("/rodar-cobrador", response_model=schemas.RunResult)
+def rodar_cobrador(db: Session = Depends(get_db)):
+    hoje = date.today()
+
+    cobrancas = db.query(models.Cobranca).filter(models.Cobranca.status == "ABERTO").all()
+
+    enviados = pulados = sem_email = erros = 0
+
+    for c in cobrancas:
+        if not c.email_cobranca:
+            sem_email += 1
+            continue
+
+        if not should_send_today(hoje, c.vencimento, c.ultimo_envio_em):
+            pulados += 1
+            continue
+
+        subject, body = build_charge_email(
+            cliente_nome=c.cliente_nome,
+            valor=c.valor,
+            vencimento=c.vencimento,
+            descricao=c.descricao or "Cobrança",
+            texto_extra=None
+        )
+
+        try:
+            mailer.send(c.email_cobranca, subject, body)
+
+            c.ultimo_envio_em = hoje
+            db.add(models.Envio(
+                cobranca_id=c.id,
+                tipo="COBRANCA",
+                canal="EMAIL",
+                para=c.email_cobranca,
+                assunto=subject,
+                corpo=body,
+                status="ENVIADO",
+            ))
+            enviados += 1
+        except Exception as e:
+            db.add(models.Envio(
+                cobranca_id=c.id,
+                tipo="COBRANCA",
+                canal="EMAIL",
+                para=c.email_cobranca,
+                assunto=subject,
+                corpo=body,
+                status="FALHA",
+                erro=str(e),
+            ))
+            erros += 1
+
     db.commit()
-    db.refresh(cobranca)  # agora cobranca.id existe
+    return {"enviados": enviados, "pulados": pulados, "sem_email": sem_email, "erros": erros}
 
-    # 2) gera boleto (mock)
-    boleto_data = provider.gerar_boleto(
-        valor=cobranca.valor,
-        vencimento=cobranca.vencimento,
-        sacado_nome=cobranca.sacado_nome
-    )
+@app.post("/marcar-pago")
+def marcar_pago(payload: schemas.MarcarPagoIn, db: Session = Depends(get_db)):
+    if not payload.nosso_numero and not payload.documento:
+        raise HTTPException(status_code=400, detail="Informe nosso_numero ou documento")
 
-    # 3) salva boleto e atualiza status da cobrança
-    cobranca.provider_charge_id = boleto_data["provider_charge_id"]
-    cobranca.status = "BOLETO_GERADO"
+    q = db.query(models.Cobranca)
+    if payload.nosso_numero:
+        q = q.filter(models.Cobranca.nosso_numero == payload.nosso_numero)
+    else:
+        q = q.filter(models.Cobranca.documento == payload.documento)
 
-    boleto = models.Boleto(
-        cobranca_id=cobranca.id,
-        linha_digitavel=boleto_data["linha_digitavel"],
-        pdf_url=boleto_data["pdf_url"],
-        status="GERADO"
-    )
-    db.add(boleto)
-
-    # 4) registra uma notificação pendente
-    notif = models.Notificacao(
-        cobranca_id=cobranca.id,
-        tipo="EMAIL",
-        para=cobranca.remetente_email,
-        status="PENDENTE",
-        tentativas=0,
-    )
-    db.add(notif)
-
-    db.commit()
-
-    # 5) envia notificação em background (não trava a API)
-    background.add_task(
-        notifier.enviar_email_boleto_gerado,
-        cobranca.remetente_email,
-        cobranca.id,
-        boleto.pdf_url,
-        boleto.linha_digitavel
-    )
-
-    return {
-        "id": cobranca.id,
-        "status": cobranca.status,
-        "boleto": {
-            "linha_digitavel": boleto.linha_digitavel,
-            "pdf_url": boleto.pdf_url
-        }
-    }
-
-@app.get("/cobrancas/{cobranca_id}", response_model=schemas.CobrancaOut)
-def buscar_cobranca(cobranca_id: int, db: Session = Depends(get_db)):
-    cobranca = db.query(models.Cobranca).filter(models.Cobranca.id == cobranca_id).first()
-    if not cobranca:
+    c = q.first()
+    if not c:
         raise HTTPException(status_code=404, detail="Cobrança não encontrada")
 
-    boleto = db.query(models.Boleto).filter(models.Boleto.cobranca_id == cobranca.id).first()
+    if c.status == "PAGO":
+        return {"ok": True, "msg": "Já estava pago"}
 
-    return {
-        "id": cobranca.id,
-        "status": cobranca.status,
-        "boleto": None if not boleto else {
-            "linha_digitavel": boleto.linha_digitavel,
-            "pdf_url": boleto.pdf_url
-        }
-    }
+    c.status = "PAGO"
+    c.pago_em = payload.pago_em or date.today()
+
+    if c.email_cobranca:
+        subject, body = build_paid_email(c.cliente_nome, c.valor, c.descricao or "Cobrança")
+        mailer.send(c.email_cobranca, subject, body)
+        db.add(models.Envio(
+            cobranca_id=c.id,
+            tipo="CONFIRMACAO",
+            canal="EMAIL",
+            para=c.email_cobranca,
+            assunto=subject,
+            corpo=body,
+            status="ENVIADO",
+        ))
+
+    db.commit()
+    return {"ok": True}
+
+
+    @app.get("/cobrancas")
+def listar_cobrancas(db: Session = Depends(get_db)):
+    items = db.query(models.Cobranca).order_by(models.Cobranca.vencimento.asc()).limit(50).all()
+    return [{
+        "id": c.id,
+        "cliente": c.cliente_nome,
+        "email": c.email_cobranca,
+        "valor": c.valor,
+        "vencimento": str(c.vencimento),
+        "status": c.status,
+        "nosso_numero": c.nosso_numero,
+        "documento": c.documento
+    } for c in items]

@@ -3,54 +3,62 @@ from sqlalchemy.orm import relationship
 from datetime import datetime
 from .db import Base
 
+class Cliente(Base):
+    __tablename__ = "clientes"
+
+    id = Column(Integer, primary_key=True, index=True)
+    codigo = Column(String, nullable=True)              # coluna "Código" da planilha
+    nome = Column(String, nullable=False)
+    nome_norm = Column(String, nullable=False, index=True)  # nome normalizado p/ cruzar
+    email_cobranca = Column(String, nullable=True)
+    documento = Column(String, nullable=True)           # CPF/CNPJ
+
+    cobrancas = relationship("Cobranca", back_populates="cliente")
+
 class Cobranca(Base):
     __tablename__ = "cobrancas"
 
     id = Column(Integer, primary_key=True, index=True)
 
-    remetente_nome = Column(String, nullable=False)
-    remetente_email = Column(String, nullable=False)
+    documento = Column(String, nullable=True)       # "Documento" do contas a receber (ex.: 005445/1)
+    nosso_numero = Column(String, nullable=True)    # "Nosso Numero" do contas a receber
 
-    sacado_nome = Column(String, nullable=False)
-    sacado_email = Column(String, nullable=False)
+    cliente_id = Column(Integer, ForeignKey("clientes.id"), nullable=True)
+    cliente_nome = Column(String, nullable=False)
+    email_cobranca = Column(String, nullable=True)
 
-    valor = Column(Float, nullable=False)
     vencimento = Column(Date, nullable=False)
+    valor = Column(Float, nullable=False)
+    saldo = Column(Float, nullable=True)
 
-    status = Column(String, nullable=False, default="CRIADA")
-    provider_charge_id = Column(String, nullable=True)
+    descricao = Column(String, nullable=True)        # texto que vai no e-mail
+    status = Column(String, nullable=False, default="ABERTO")  # ABERTO / PAGO
 
-    # ligações (1 cobrança -> 1 boleto) e (1 cobrança -> várias notificações)
-    boleto = relationship("Boleto", back_populates="cobranca", uselist=False)
-    notificacoes = relationship("Notificacao", back_populates="cobranca")
+    ultimo_envio_em = Column(Date, nullable=True)    # evita mandar 2x no mesmo dia
+    pago_em = Column(Date, nullable=True)
 
-class Boleto(Base):
-    __tablename__ = "boletos"
+    criado_em = Column(DateTime, default=datetime.utcnow)
+    atualizado_em = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
-    id = Column(Integer, primary_key=True, index=True)
-    cobranca_id = Column(Integer, ForeignKey("cobrancas.id"), nullable=False)
+    cliente = relationship("Cliente", back_populates="cobrancas")
+    envios = relationship("Envio", back_populates="cobranca")
 
-    linha_digitavel = Column(String, nullable=False)
-    pdf_url = Column(String, nullable=False)
-
-    status = Column(String, nullable=False, default="GERADO")
-    gerado_em = Column(DateTime, default=datetime.utcnow)
-
-    cobranca = relationship("Cobranca", back_populates="boleto")
-
-class Notificacao(Base):
-    __tablename__ = "notificacoes"
+class Envio(Base):
+    __tablename__ = "envios"
 
     id = Column(Integer, primary_key=True, index=True)
     cobranca_id = Column(Integer, ForeignKey("cobrancas.id"), nullable=False)
 
-    tipo = Column(String, nullable=False, default="EMAIL")
+    tipo = Column(String, nullable=False)     # COBRANCA ou CONFIRMACAO
+    canal = Column(String, nullable=False)    # EMAIL (por enquanto)
+
     para = Column(String, nullable=False)
+    assunto = Column(String, nullable=False)
+    corpo = Column(String, nullable=False)
 
-    status = Column(String, nullable=False, default="PENDENTE")  # PENDENTE, ENVIADA, FALHA
-    tentativas = Column(Integer, nullable=False, default=0)
-    ultimo_erro = Column(String, nullable=True)
+    status = Column(String, nullable=False)   # ENVIADO / FALHA
+    erro = Column(String, nullable=True)
 
-    criada_em = Column(DateTime, default=datetime.utcnow)
+    enviado_em = Column(DateTime, default=datetime.utcnow)
 
-    cobranca = relationship("Cobranca", back_populates="notificacoes")
+    cobranca = relationship("Cobranca", back_populates="envios")
