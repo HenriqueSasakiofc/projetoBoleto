@@ -7,11 +7,11 @@ from . import models, schemas
 from .services.importer import import_from_excels
 from .services.rules import should_send_today
 from .services.notifier import build_charge_email, build_paid_email
+from .services.notifier import SmtpMailer
 
-# cria as tabelas no SQLite (boleto.db) se ainda não existirem
 Base.metadata.create_all(bind=engine)
 
-app = FastAPI(title="Cobrador MVP (sem enviar email real ainda)")
+app = FastAPI(title="Cobrador MVP (outbox)")
 
 def get_db():
     db = SessionLocal()
@@ -28,7 +28,6 @@ def home():
 def health():
     return {"ok": True}
 
-# 1) IMPORTAR PLANILHAS
 @app.post("/importar", response_model=schemas.ImportResult)
 async def importar(
     contas: UploadFile = File(...),
@@ -41,7 +40,6 @@ async def importar(
     c1, c2, sem_email = import_from_excels(db, contas_bytes, clientes_bytes)
     return {"clientes_importados": c1, "cobrancas_importadas": c2, "cobrancas_sem_email": sem_email}
 
-# 2) LISTAR COBRANÇAS (para conferir se importou e se tem email)
 @app.get("/cobrancas")
 def listar_cobrancas(db: Session = Depends(get_db)):
     items = db.query(models.Cobranca).order_by(models.Cobranca.vencimento.asc()).limit(100).all()
@@ -57,24 +55,6 @@ def listar_cobrancas(db: Session = Depends(get_db)):
         "ultimo_envio_em": str(c.ultimo_envio_em) if c.ultimo_envio_em else None
     } for c in items]
 
-
-@app.get("/cobrancas/sem-email")
-def cobrancas_sem_email(db: Session = Depends(get_db)):
-    items = (
-        db.query(models.Cobranca)
-        .filter(models.Cobranca.status == "ABERTO", models.Cobranca.email_cobranca == None)
-        .all()
-    )
-    return [{
-        "id": c.id,
-        "cliente": c.cliente_nome,
-        "documento": c.documento,
-        "nosso_numero": c.nosso_numero,
-        "vencimento": str(c.vencimento),
-        "valor": c.valor
-    } for c in items]
-
-# 3) SIMULAR QUEM SERIA COBRADO HOJE (sem gerar outbox)
 @app.get("/simular-cobranca")
 def simular_cobranca(db: Session = Depends(get_db)):
     hoje = date.today()
@@ -95,7 +75,6 @@ def simular_cobranca(db: Session = Depends(get_db)):
 
     return {"hoje": str(hoje), "vai_cobrar": vai_cobrar, "nao_vai": nao_vai}
 
-# 4) RODAR COBRADOR (gera OUTBOX com status PENDENTE, NÃO ENVIA EMAIL REAL)
 @app.post("/rodar-cobrador", response_model=schemas.RunResult)
 def rodar_cobrador(db: Session = Depends(get_db)):
     hoje = date.today()
@@ -121,7 +100,6 @@ def rodar_cobrador(db: Session = Depends(get_db)):
         )
 
         try:
-            # NÃO envia email: só cria uma mensagem pendente na outbox (tabela Envios)
             db.add(models.Envio(
                 cobranca_id=c.id,
                 tipo="COBRANCA",
@@ -149,7 +127,6 @@ def rodar_cobrador(db: Session = Depends(get_db)):
     db.commit()
     return {"enviados": enviados, "pulados": pulados, "sem_email": sem_email, "erros": erros}
 
-# 5) VER OUTBOX (o que seria enviado)
 @app.get("/outbox")
 def ver_outbox(db: Session = Depends(get_db)):
     pendentes = db.query(models.Envio).filter(models.Envio.status == "PENDENTE").order_by(models.Envio.enviado_em.asc()).limit(200).all()
@@ -163,7 +140,33 @@ def ver_outbox(db: Session = Depends(get_db)):
         "enviado_em": str(e.enviado_em)
     } for e in pendentes]
 
-# 6) MARCAR COMO PAGO (simula integração) + cria confirmação PENDENTE
+@app.get("/outbox/{envio_id}")
+def ver_envio(envio_id: int, db: Session = Depends(get_db)):
+    e = db.query(models.Envio).filter(models.Envio.id == envio_id).first()
+    if not e:
+        raise HTTPException(status_code=404, detail="Envio não encontrado")
+    return {
+        "id": e.id,
+        "tipo": e.tipo,
+        "para": e.para,
+        "assunto": e.assunto,
+        "corpo": e.corpo,
+        "status": e.status,
+        "erro": e.erro
+    }
+
+@app.post("/outbox/enviar-para-teste/{envio_id}")
+def enviar_para_teste(envio_id: int, to: str, db: Session = Depends(get_db)):
+    e = db.query(models.Envio).filter(models.Envio.id == envio_id).first()
+    if not e:
+        raise HTTPException(status_code=404, detail="Envio não encontrado")
+
+    smtp = SmtpMailer.from_env()
+    smtp.send(to_email=to, subject=e.assunto, body=e.corpo)
+
+    # IMPORTANTE: não marca como ENVIADO (porque foi só teste)
+    return {"ok": True, "msg": "Enviado para teste (não alterei o status)", "envio_id": e.id, "to": to}
+
 @app.post("/marcar-pago")
 def marcar_pago(payload: schemas.MarcarPagoIn, db: Session = Depends(get_db)):
     if not payload.nosso_numero and not payload.documento:
@@ -185,7 +188,6 @@ def marcar_pago(payload: schemas.MarcarPagoIn, db: Session = Depends(get_db)):
     c.status = "PAGO"
     c.pago_em = payload.pago_em or date.today()
 
-    # cria confirmação pendente (também não envia email real)
     if c.email_cobranca:
         subject, body = build_paid_email(
             cliente_nome=c.cliente_nome,
@@ -204,3 +206,39 @@ def marcar_pago(payload: schemas.MarcarPagoIn, db: Session = Depends(get_db)):
 
     db.commit()
     return {"ok": True}
+
+
+
+@app.post("/teste-email")
+def teste_email(to: str):
+    smtp = SmtpMailer.from_env()
+    smtp.send(
+        to_email=to,
+        subject="Teste do Cobrador (SMTP OK)",
+        body="Se você recebeu este e-mail, o envio SMTP real está funcionando."
+    )
+    return {"ok": True}
+
+
+@app.post("/outbox/enviar-proximo-teste")
+def enviar_proximo_teste(db: Session = Depends(get_db)):
+    test_email = os.getenv("TEST_EMAIL")
+    if not test_email:
+        raise HTTPException(status_code=400, detail="TEST_EMAIL não configurado.")
+
+    e = (
+        db.query(models.Envio)
+        .filter(models.Envio.status == "PENDENTE")
+        .order_by(models.Envio.enviado_em.asc())
+        .first()
+    )
+    if not e:
+        return {"ok": False, "msg": "Não existe mensagem PENDENTE na outbox"}
+
+    smtp = SmtpMailer.from_env()
+
+    # envia só para o email de teste
+    smtp.send(to_email=test_email, subject=e.assunto, body=e.corpo)
+
+    # não muda status (você pode testar várias vezes sem “consumir”)
+    return {"ok": True, "enviado_para": test_email, "envio_id": e.id, "original_para_seria": e.para}
